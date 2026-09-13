@@ -179,6 +179,21 @@ section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {
     color: #202536 !important;
 }
 
+/* ---------- User question ---------- */
+.rc-question-card {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 14px 18px;
+    margin: 0 0 18px 0;
+    border: 1px solid var(--rc-border);
+    border-left: 4px solid var(--rc-cyan);
+    border-radius: 12px;
+    background: rgba(0,229,255,0.06);
+    color: var(--rc-text) !important;
+    line-height: 1.55;
+}
+.rc-question-card strong { color: var(--rc-cyan) !important; }
+
 /* ---------- Main content ---------- */
 [data-testid="stAppViewContainer"] {
     overflow-x: hidden;
@@ -1018,9 +1033,10 @@ def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None
     )
 
 
-def build_evidence_payload(parsed_files: list, framework: str = "Generic Financial") -> dict:
+def build_evidence_payload(parsed_files: list, framework: str = "Generic Financial", user_question: str = "") -> dict:
     payload = {
         "business_model_framework": framework,
+        "user_question": (user_question or "").strip(),
         "framework_heuristics": compute_framework_heuristics(parsed_files, framework),
         "driver_tree_attribution": compute_driver_tree_attribution(parsed_files, framework),
         "files": [],
@@ -1086,6 +1102,7 @@ def build_full_timeline(parsed_files: list, ai_result: dict) -> pd.DataFrame:
 
 for key, default in [
     ("business_model_framework", "Generic Financial"),
+    ("user_question", ""),
     ("parsed_files", []), ("ai_result", None), ("timeline_df", None),
     ("driver_tree", None), ("last_run_at", None), ("parse_errors", []),
     ("ai_config_error", False),
@@ -1110,6 +1127,22 @@ with st.sidebar:
         index=BUSINESS_MODEL_FRAMEWORKS.index(st.session_state.business_model_framework),
         key="business_model_framework",
         help="Mandatory: selects the domain-specific heuristic engine and consulting persona.",
+    )
+
+    st.markdown("#### ❓ Ask a Question About Your Data")
+    st.caption("Optional: ask anything about the uploaded evidence before running the analysis.")
+    user_question = st.text_area(
+        "Your data question",
+        value=st.session_state.user_question,
+        key="user_question",
+        height=130,
+        label_visibility="visible",
+        placeholder=(
+            "Example: Why did revenue drop on 2026-09-04?\n"
+            "Which factor had the biggest impact?\n"
+            "What should we investigate first?"
+        ),
+        help="Optional. Your question is sent to Groq together with the evidence so the analysis directly answers it.",
     )
 
     st.markdown("#### 📁 Upload Evidence")
@@ -1137,6 +1170,7 @@ with st.sidebar:
 
 if reset_clicked:
     st.session_state.parsed_files = []
+    st.session_state.user_question = ""
     st.session_state.ai_result = None
     st.session_state.ai_config_error = False
     st.session_state.timeline_df = None
@@ -1186,7 +1220,11 @@ if run_clicked:
         try:
             with st.spinner("Parsing evidence and consulting Root Cause AI..."):
                 client = get_client()
-                payload = build_evidence_payload(parsed, st.session_state.business_model_framework)
+                payload = build_evidence_payload(
+                    parsed,
+                    st.session_state.business_model_framework,
+                    st.session_state.user_question,
+                )
                 st.session_state.driver_tree = payload.get("driver_tree_attribution")
                 ai_result = analyze_root_cause(client, payload)
             st.session_state.ai_result = ai_result
@@ -1217,6 +1255,11 @@ parsed_files = st.session_state.parsed_files
 ai_result = st.session_state.ai_result
 selected_framework = st.session_state.business_model_framework
 st.caption(f"Business Model Framework: **{selected_framework}**")
+if st.session_state.user_question.strip():
+    st.markdown(
+        f"<div class=\"rc-question-card\"><strong>❓ Your question</strong><br>{st.session_state.user_question.strip()}</div>",
+        unsafe_allow_html=True,
+    )
 timeline_df = st.session_state.timeline_df
 driver_tree = st.session_state.get("driver_tree")
 ai_config = get_ai_config()
@@ -1303,6 +1346,12 @@ with tab_analysis:
         st.warning("The AI response couldn't be parsed as valid JSON. Raw output below.")
         st.code(ai_result.get("_raw_text", ""))
     else:
+        st.markdown("### ❓ Answer to Your Data Question")
+        if st.session_state.user_question.strip():
+            st.info(ai_result.get("question_answer", "No direct answer was returned by the analysis engine."))
+        else:
+            st.caption("No question was entered. The AI performed a general root-cause review.")
+
         st.markdown("### Summary")
         st.write(ai_result.get("summary", ""))
 
