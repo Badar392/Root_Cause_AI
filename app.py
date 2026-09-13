@@ -20,7 +20,13 @@ import streamlit as st
 import parsers
 import timeline
 import report
-from groq_client import GroqClientError, get_client, analyze_root_cause, get_ai_config
+import alerts
+import connectors
+import benchmarks
+from groq_client import (
+    GroqClientError, get_client, analyze_root_cause, get_ai_config,
+    SELECTABLE_GROQ_MODELS, DEFAULT_GROQ_MODEL,
+)
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +47,32 @@ BUSINESS_MODEL_FRAMEWORKS = [
     "SaaS / Subscription (MRR/Churn)",
     "B2B Marketing Funnel",
 ]
+
+
+# =============================================================================
+# Role-based access
+# =============================================================================
+# Single-app, single-tenant "role" distinction, not a full multi-user auth
+# system: everyone starts as "analyst" (can run analyses, use connectors with
+# admin-configured credentials, view benchmarks). Entering the correct admin
+# passcode for this session unlocks "admin" (sees AI configuration status,
+# can override the model, sees alerting/connector configuration status).
+# The passcode itself is infra, resolved the same hidden way as every other
+# secret in this app — never hardcoded, never displayed.
+
+def _admin_passcode_configured() -> str | None:
+    try:
+        value = st.secrets.get("ADMIN_PASSCODE", None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    except Exception:
+        pass
+    env_value = os.environ.get("ADMIN_PASSCODE")
+    return env_value.strip() if env_value and env_value.strip() else None
+
+
+def is_admin() -> bool:
+    return st.session_state.get("user_role") == "admin"
 
 
 # =============================================================================
@@ -1065,6 +1097,20 @@ def render_evidence_coverage(ai_result: dict) -> None:
         )
 
 
+def render_benchmark_check(framework: str, heuristics: dict, driver_tree: dict) -> None:
+    """Compare a few concrete computed numbers against this framework's
+    benchmark library and flag anything that exceeds the reference threshold."""
+    flags = benchmarks.evaluate_against_benchmarks(framework, heuristics, driver_tree)
+    if not flags:
+        return
+    st.markdown("### 📚 Benchmark Check")
+    st.caption("Computed figures compared against general industry-typical reference points — "
+               "not a verdict, just a quick gut-check.")
+    for f in flags:
+        icon = "⚠️" if f["flagged"] else "✅"
+        st.write(f"{icon} **{f['metric']}**: {f['observed']} (reference: {f['threshold']})")
+
+
 def render_counter_hypotheses(ai_result: dict) -> None:
     """Render the AI's Devil's Advocate matrix so blind-spot checks are auditable."""
     rows = ai_result.get("counter_hypotheses") if ai_result else None
@@ -1244,6 +1290,7 @@ def build_evidence_payload(
         "user_question": (user_question or "").strip(),
         "framework_heuristics": compute_framework_heuristics(parsed_files, framework),
         "driver_tree_attribution": driver_tree,
+        "industry_benchmarks": benchmarks.get_benchmarks_for_framework(framework),
         "files": [],
     }
     for pf in parsed_files:
@@ -1311,6 +1358,8 @@ for key, default in [
     ("parsed_files", []), ("ai_result", None), ("timeline_df", None),
     ("driver_tree", None), ("last_run_at", None), ("parse_errors", []),
     ("ai_config_error", False), ("last_run_error", None),
+    ("user_role", "analyst"), ("admin_model_override", None),
+    ("alert_results", []), ("connector_error", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1325,6 +1374,32 @@ with st.sidebar:
     st.caption("Evidence in. Root cause out.")
     st.divider()
 
+    # -------------------------------------------------------------------
+    # Role-based access
+    # -------------------------------------------------------------------
+    if is_admin():
+        st.markdown("#### 🔐 Access Level")
+        st.success("Admin mode unlocked", icon="🔓")
+        if st.button("Log out of admin mode", use_container_width=True, key="admin_logout_btn"):
+            st.session_state.user_role = "analyst"
+            st.rerun()
+    else:
+        with st.expander("🔐 Admin sign-in"):
+            st.caption("Analysts can run analyses, use connectors, and view benchmarks without this. "
+                       "Admin mode additionally shows AI/alerting/connector configuration status and "
+                       "lets you override the model.")
+            if not _admin_passcode_configured():
+                st.caption("Admin mode is not configured for this deployment (`ADMIN_PASSCODE` not set).")
+            else:
+                admin_pw = st.text_input("Admin passcode", type="password", key="admin_passcode_input")
+                if st.button("Unlock", key="admin_unlock_btn"):
+                    if admin_pw and admin_pw == _admin_passcode_configured():
+                        st.session_state.user_role = "admin"
+                        st.rerun()
+                    else:
+                        st.error("Incorrect passcode.")
+    st.divider()
+
     st.markdown("#### 🧭 Business Model Framework")
     business_model_framework = st.selectbox(
         "Business Model Framework",
@@ -1333,6 +1408,18 @@ with st.sidebar:
         key="business_model_framework",
         help="Mandatory: selects the domain-specific heuristic engine and consulting persona.",
     )
+
+    with st.expander("📚 Benchmark Library (reference)"):
+        st.caption(
+            "Industry-typical thresholds for the selected framework. General reference points, "
+            "not a guarantee for any specific business — the AI uses these only to calibrate "
+            "severity language, never as a substitute for your actual evidence."
+        )
+        rows = benchmarks.get_benchmarks_for_framework(business_model_framework)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No benchmark reference points defined for this framework yet.")
 
     st.markdown("#### 📊 Comparison Mode")
     comparison_mode_enabled = st.checkbox(
@@ -1412,11 +1499,86 @@ with st.sidebar:
     st.caption("Accepted: .csv .pdf .docx .txt .eml — multiple files at once.")
     st.markdown('</div>', unsafe_allow_html=True)
 
+    st.markdown("#### 🔌 Or Pull From a Connected Source")
+    connector_config = connectors.get_connector_config()
+    connector_choice = st.selectbox(
+        "Data connector",
+        options=["None", "Google Sheet", "Database Query", "Stripe", "Google Analytics 4"],
+        key="connector_choice",
+        label_visibility="collapsed",
+    )
+    connector_fetch_clicked = False
+    connector_fetch_fn = None
+
+    if connector_choice == "Google Sheet":
+        st.caption("Sheet must be shared as 'Anyone with the link can view'. No credentials needed.")
+        sheet_url = st.text_input("Google Sheet URL or ID", key="connector_sheet_url",
+                                   placeholder="https://docs.google.com/spreadsheets/d/...")
+        connector_fetch_clicked = st.button("📥 Fetch Sheet", use_container_width=True, key="fetch_sheet_btn")
+        connector_fetch_fn = lambda: connectors.fetch_google_sheet(sheet_url)
+
+    elif connector_choice == "Database Query":
+        if connector_config.database_configured:
+            st.caption("✅ Database connection configured by your admin.")
+        else:
+            st.caption("⚠️ No database connection configured. Ask your admin to set `DATABASE_URL`.")
+        db_query = st.text_area("SQL query (SELECT/WITH only)", key="connector_db_query", height=90,
+                                 placeholder="SELECT date, revenue, orders FROM sales ORDER BY date")
+        connector_fetch_clicked = st.button("📥 Run Query", use_container_width=True, key="fetch_db_btn",
+                                             disabled=not connector_config.database_configured)
+        connector_fetch_fn = lambda: connectors.fetch_database_query(connector_config.database_url, db_query)
+
+    elif connector_choice == "Stripe":
+        if connector_config.stripe_configured:
+            st.caption("✅ Stripe connection configured by your admin.")
+        else:
+            st.caption("⚠️ No Stripe key configured. Ask your admin to set `STRIPE_API_KEY`.")
+        stripe_lookback = st.slider("Lookback (days)", 7, 365, 90, key="connector_stripe_lookback")
+        connector_fetch_clicked = st.button("📥 Fetch Stripe Revenue", use_container_width=True, key="fetch_stripe_btn",
+                                             disabled=not connector_config.stripe_configured)
+        connector_fetch_fn = lambda: connectors.fetch_stripe_revenue(connector_config.stripe_api_key, stripe_lookback)
+
+    elif connector_choice == "Google Analytics 4":
+        if connector_config.ga4_configured:
+            st.caption("✅ GA4 connection configured by your admin.")
+        else:
+            st.caption("⚠️ No GA4 connection configured. Ask your admin to set `GA4_PROPERTY_ID` / `GA4_CREDENTIALS_PATH`.")
+        ga4_lookback = st.slider("Lookback (days)", 7, 365, 90, key="connector_ga4_lookback")
+        connector_fetch_clicked = st.button("📥 Fetch GA4 Traffic", use_container_width=True, key="fetch_ga4_btn",
+                                             disabled=not connector_config.ga4_configured)
+        connector_fetch_fn = lambda: connectors.fetch_ga4_traffic(
+            connector_config.ga4_property_id, connector_config.ga4_credentials_path, ga4_lookback)
+
+    if st.session_state.get("connector_error"):
+        st.error(st.session_state["connector_error"])
+
     load_sample = st.button("🎬 Load Sample Incident Bundle", use_container_width=True)
 
     st.divider()
     run_clicked = st.button("🚀 Run Root Cause Analysis", type="primary", use_container_width=True)
     reset_clicked = st.button("🗑️ Clear Session", use_container_width=True)
+
+    if is_admin():
+        st.divider()
+        st.markdown("#### ⚙️ Admin Controls")
+        with st.expander("🧠 AI Model Override"):
+            model_choice = st.selectbox(
+                "Model (this session only)",
+                options=["(use default)"] + SELECTABLE_GROQ_MODELS,
+                key="admin_model_choice",
+            )
+            st.session_state.admin_model_override = None if model_choice == "(use default)" else model_choice
+            st.caption(f"Default: `{DEFAULT_GROQ_MODEL}`")
+        with st.expander("🔔 Alerting Status"):
+            alert_cfg = alerts.get_alert_config()
+            st.write(f"Slack: {'✅ Configured' if alert_cfg.slack_configured else '⚠️ Not configured'}")
+            st.write(f"Email: {'✅ Configured' if alert_cfg.email_configured else '⚠️ Not configured'}")
+            st.caption("Alerts auto-send when a run confirms a High/Critical finding. "
+                       "Configured via `SLACK_WEBHOOK_URL` / `ALERT_SMTP_*` secrets.")
+        with st.expander("🔌 Connector Status"):
+            st.write(f"Database: {'✅ Configured' if connector_config.database_configured else '⚠️ Not configured'}")
+            st.write(f"Stripe: {'✅ Configured' if connector_config.stripe_configured else '⚠️ Not configured'}")
+            st.write(f"GA4: {'✅ Configured' if connector_config.ga4_configured else '⚠️ Not configured'}")
 
 
 # =============================================================================
@@ -1439,6 +1601,22 @@ if reset_clicked:
     st.session_state.last_run_at = None
     st.session_state.parse_errors = []
     st.session_state.last_run_error = None  # also clear any stale error banner
+    st.session_state.connector_error = None
+    st.session_state.alert_results = []
+    st.rerun()
+
+if connector_fetch_clicked and connector_fetch_fn is not None:
+    try:
+        fetched = connector_fetch_fn()
+        st.session_state.parsed_files = st.session_state.parsed_files + [fetched]
+        st.session_state.connector_error = None
+        st.session_state.ai_result = None
+        st.session_state.timeline_df = None
+        st.session_state.ai_config_error = False
+    except ValueError as e:
+        st.session_state.connector_error = str(e)
+    except Exception as e:
+        st.session_state.connector_error = f"{type(e).__name__}: {e}"
     st.rerun()
 
 if load_sample:
@@ -1481,7 +1659,8 @@ if run_clicked:
     if parsed:
         try:
             with st.spinner("Parsing evidence and consulting Root Cause AI..."):
-                client = get_client()
+                model_override = st.session_state.get("admin_model_override") if is_admin() else None
+                client = get_client(model_override=model_override)
                 baseline_range, current_range = _resolve_comparison_ranges()
                 driver_tree = compute_driver_tree_attribution(
                     parsed, st.session_state.business_model_framework,
@@ -1501,6 +1680,21 @@ if run_clicked:
             st.session_state.ai_config_error = False
             st.session_state.last_run_error = None
             st.sidebar.success("Analysis complete — see the results in the tabs below.")
+
+            # Alerting/webhooks: auto-notify configured Slack/email sinks the
+            # moment a run confirms a High/Critical finding. Best-effort —
+            # a failed webhook/SMTP call never breaks the analysis itself.
+            confirmed = _high_severity_confirmed(ai_result)
+            alert_results = alerts.maybe_send_alerts(
+                ai_result, [pf["filename"] for pf in parsed], confirmed,
+            )
+            st.session_state.alert_results = alert_results
+            if confirmed and alert_results:
+                for r in alert_results:
+                    if r.sent:
+                        st.sidebar.info(f"🔔 Alert sent via {r.sink}.")
+                    else:
+                        st.sidebar.warning(f"🔔 {r.sink} alert not sent: {r.detail}")
         except GroqClientError as e:
             # The end-user banner stays generic on purpose, but we keep the real
             # message so it's visible right where the click happened, and so it
@@ -1567,14 +1761,17 @@ if (not ai_config.configured) or st.session_state.get("ai_config_error", False):
         </div>
     </div>
     """, unsafe_allow_html=True)
-    with st.expander("Technical details (for the app owner/admin)"):
-        if not ai_config.configured:
-            st.write(
-                "`GROQ_API_KEY` is not set. Add it to `.streamlit/secrets.toml` as "
-                "`GROQ_API_KEY = \"...\"`, or set it as an environment variable, then restart the app."
-            )
-        if st.session_state.get("last_run_error"):
-            st.code(st.session_state["last_run_error"])
+    if is_admin():
+        with st.expander("Technical details (admin)"):
+            if not ai_config.configured:
+                st.write(
+                    "`GROQ_API_KEY` is not set. Add it to `.streamlit/secrets.toml` as "
+                    "`GROQ_API_KEY = \"...\"`, or set it as an environment variable, then restart the app."
+                )
+            if st.session_state.get("last_run_error"):
+                st.code(st.session_state["last_run_error"])
+    else:
+        st.caption("Sign in as an admin in the sidebar to see configuration details.")
 
 # =============================================================================
 # Metrics row
@@ -1657,7 +1854,21 @@ with tab_analysis:
         st.markdown("### Summary")
         st.write(ai_result.get("summary", ""))
 
+        if st.session_state.get("alert_results"):
+            sent = [r for r in st.session_state["alert_results"] if r.sent]
+            failed = [r for r in st.session_state["alert_results"] if not r.sent]
+            if sent:
+                st.caption("🔔 " + "; ".join(f"Alert sent via {r.sink}" for r in sent))
+            if failed:
+                st.caption("⚠️ " + "; ".join(f"{r.sink} alert failed: {r.detail}" for r in failed))
+
         render_evidence_coverage(ai_result)
+
+        render_benchmark_check(
+            selected_framework,
+            compute_framework_heuristics(parsed_files, selected_framework),
+            driver_tree,
+        )
 
         if driver_tree and driver_tree.get("applicable"):
             st.markdown("### 🌳 Mathematical Driver Tree")
