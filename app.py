@@ -257,18 +257,61 @@ section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {
     margin-bottom: 10px;
 }
 
-.stButton>button, .stDownloadButton>button {
-    background: linear-gradient(90deg, var(--rc-emerald), var(--rc-cyan));
-    color: #0b0b14 !important;
-    border: none;
-    border-radius: 10px;
-    font-weight: 700;
-    padding: 0.55rem 1.1rem;
-    transition: transform 0.08s ease, box-shadow 0.15s ease;
+/* Buttons: explicit high-contrast styling.  Streamlit renders the visible
+   label inside nested elements, so style both the button and its children. */
+.stButton > button,
+.stDownloadButton > button {
+    background: linear-gradient(90deg, var(--rc-emerald), var(--rc-cyan)) !important;
+    color: #071014 !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-weight: 800 !important;
+    min-height: 42px !important;
+    padding: 0.55rem 0.8rem !important;
+    text-shadow: none !important;
+    opacity: 1 !important;
+    transition: transform 0.08s ease, box-shadow 0.15s ease !important;
 }
-.stButton>button:hover, .stDownloadButton>button:hover {
-    box-shadow: 0 0 18px rgba(0, 229, 255, 0.35);
+
+.stButton > button *,
+.stDownloadButton > button * {
+    color: #071014 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    text-shadow: none !important;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    background: linear-gradient(90deg, var(--rc-cyan), var(--rc-emerald)) !important;
+    color: #071014 !important;
+    box-shadow: 0 0 18px rgba(0, 229, 255, 0.35) !important;
     transform: translateY(-1px);
+}
+
+/* Sidebar buttons get an explicit rule so global Streamlit/theme styles
+   cannot wash out the label. */
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] .stDownloadButton > button {
+    color: #071014 !important;
+    opacity: 1 !important;
+}
+
+section[data-testid="stSidebar"] .stButton > button *,
+section[data-testid="stSidebar"] .stDownloadButton > button * {
+    color: #071014 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Primary Run Root Cause Analysis button */
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: linear-gradient(90deg, #7168ff, #00e5ff) !important;
+    color: #ffffff !important;
+}
+
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] * {
+    color: #ffffff !important;
 }
 
 [data-testid="stFileUploaderDropzone"] {
