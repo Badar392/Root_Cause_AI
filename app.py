@@ -656,7 +656,51 @@ def compute_framework_heuristics(parsed_files: list, framework: str) -> dict:
     }
 
 
-def compute_driver_tree_attribution(parsed_files: list, framework: str = "Generic Financial") -> dict:
+def _global_date_bounds(parsed_files: list):
+    """Scan every CSV's date-like column and return the overall (min, max) date.
+
+    Used only to set sensible bounds/defaults on the Comparison Mode date
+    pickers — it does not affect the driver-tree math itself.
+    """
+    all_dates = []
+    for pf in parsed_files or []:
+        df = pf.get("dataframe") if pf.get("kind") == "csv" else None
+        if df is None or df.empty:
+            continue
+        date_col = _find_column(df, ["date", "datetime", "timestamp", "day"])
+        if not date_col:
+            continue
+        parsed_dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
+        if not parsed_dates.empty:
+            all_dates.append(parsed_dates.min())
+            all_dates.append(parsed_dates.max())
+    if not all_dates:
+        return None, None
+    return min(all_dates).date(), max(all_dates).date()
+
+
+def _resolve_comparison_ranges():
+    """Read the sidebar's Comparison Mode widgets from session_state and return
+    (baseline_range, current_range) as (start, end) tuples, or (None, None)
+    when Comparison Mode is off or not fully specified (falls back to the
+    automatic chronological 50/50 split)."""
+    if not st.session_state.get("comparison_mode_enabled"):
+        return None, None
+    b_start = st.session_state.get("comparison_baseline_start")
+    b_end = st.session_state.get("comparison_baseline_end")
+    c_start = st.session_state.get("comparison_current_start")
+    c_end = st.session_state.get("comparison_current_end")
+    if not (b_start and b_end and c_start and c_end):
+        return None, None
+    return (b_start, b_end), (c_start, c_end)
+
+
+def compute_driver_tree_attribution(
+    parsed_files: list,
+    framework: str = "Generic Financial",
+    baseline_range: tuple = None,
+    current_range: tuple = None,
+) -> dict:
     """
     Detect a standard Traffic -> Conversion -> Orders -> Revenue funnel and
     mathematically decompose the revenue change between two comparable periods.
@@ -668,6 +712,13 @@ def compute_driver_tree_attribution(parsed_files: list, framework: str = "Generi
     driver contributions reconcile exactly to the modeled revenue change,
     including interaction effects. The requested first-order approximation is
     also returned for auditability.
+
+    By default (baseline_range/current_range both None) the two comparison
+    periods are an automatic chronological 50/50 split of every dated
+    observation found ("Comparison Mode" off). When both ranges are supplied
+    (each an inclusive (start, end) pair of dates/timestamps), those exact
+    date windows are used instead — "Comparison Mode" on — for a
+    user-controlled "this period vs. that period" comparison.
     """
     if _framework_key(framework) != "generic financial":
         return {
@@ -749,13 +800,31 @@ def compute_driver_tree_attribution(parsed_files: list, framework: str = "Generi
 
     combined = combined.dropna(subset=["__revenue", "__traffic", "__orders"])
     combined = combined[(combined["__traffic"] > 0) & (combined["__orders"] > 0)]
-    if len(combined) < 4:
-        return {"applicable": False, "reason": "At least four valid dated observations are required for a period comparison."}
 
-    # Split chronologically into two comparable periods.
-    split = len(combined) // 2
-    old = combined.iloc[:split]
-    new = combined.iloc[split:]
+    use_manual_periods = bool(baseline_range and current_range)
+
+    if use_manual_periods:
+        comparison_mode = "manual"
+        b_start, b_end = pd.Timestamp(baseline_range[0]), pd.Timestamp(baseline_range[1])
+        c_start, c_end = pd.Timestamp(current_range[0]), pd.Timestamp(current_range[1])
+        old = combined[(combined["__date"] >= b_start) & (combined["__date"] <= b_end)]
+        new = combined[(combined["__date"] >= c_start) & (combined["__date"] <= c_end)]
+        if old.empty or new.empty:
+            return {
+                "applicable": False,
+                "comparison_mode": comparison_mode,
+                "reason": "No valid dated observations (Revenue + Traffic + Orders) were found in one or "
+                          "both of the selected comparison periods. Try widening the date ranges.",
+            }
+    else:
+        comparison_mode = "auto_chronological_split"
+        if len(combined) < 4:
+            return {"applicable": False, "comparison_mode": comparison_mode,
+                     "reason": "At least four valid dated observations are required for a period comparison."}
+        # Split chronologically into two comparable periods.
+        split = len(combined) // 2
+        old = combined.iloc[:split]
+        new = combined.iloc[split:]
 
     def period_metrics(frame):
         traffic = float(frame["__traffic"].sum())
@@ -842,6 +911,7 @@ def compute_driver_tree_attribution(parsed_files: list, framework: str = "Generi
     return {
         "applicable": True,
         "method": "Exact Shapley allocation for Traffic × Conversion Rate × AOV",
+        "comparison_mode": comparison_mode,
         "periods": {
             "baseline": {"start": old["__date"].min().date().isoformat(), "end": old["__date"].max().date().isoformat()},
             "current": {"start": new["__date"].min().date().isoformat(), "end": new["__date"].max().date().isoformat()},
@@ -905,6 +975,96 @@ def _high_severity_confirmed(ai_result: dict) -> bool:
     return False
 
 
+_VAGUE_EVIDENCE_PHRASES = {
+    "n/a", "na", "none", "unknown", "not specified", "not available", "tbd",
+    "insufficient evidence", "see above", "various", "not provided", "no evidence",
+    "no evidence provided", "no specific evidence",
+}
+
+
+def _is_evidence_specific(text) -> bool:
+    """Heuristic: does this evidence/rationale string look like a concrete
+    citation (references a file, number, date, or specific detail) rather
+    than a vague placeholder? Pure text heuristic — no AI call involved."""
+    if not text:
+        return False
+    cleaned = str(text).strip()
+    if not cleaned or cleaned.lower() in _VAGUE_EVIDENCE_PHRASES:
+        return False
+    # Very short strings rarely carry a real citation.
+    return len(cleaned) >= 12
+
+
+def compute_evidence_coverage(ai_result: dict) -> dict:
+    """
+    Scan the AI's own JSON output (anomalies/trigger_events/recommended_actions/
+    impact_assessment) and report what fraction of findings cite concrete,
+    specific evidence vs. a vague/empty justification. Zero additional AI
+    calls — this is a static pass over data already returned by the model.
+    """
+    if not ai_result or ai_result.get("_parse_failed"):
+        return {"applicable": False}
+
+    categories = []
+
+    def _tally(label, items, field):
+        items = items or []
+        total = len(items)
+        cited = sum(1 for it in items if isinstance(it, dict) and _is_evidence_specific(it.get(field)))
+        categories.append({"label": label, "total": total, "cited": cited, "vague": total - cited})
+
+    _tally("Anomalies", ai_result.get("anomalies"), "evidence")
+    _tally("Trigger Events", ai_result.get("trigger_events"), "evidence")
+    _tally("Recommended Actions", ai_result.get("recommended_actions"), "rationale")
+
+    impact = ai_result.get("impact_assessment") or {}
+    if impact:
+        ok = _is_evidence_specific(impact.get("justification"))
+        categories.append({"label": "Impact Assessment", "total": 1, "cited": 1 if ok else 0, "vague": 0 if ok else 1})
+
+    grand_total = sum(c["total"] for c in categories)
+    grand_cited = sum(c["cited"] for c in categories)
+    coverage_pct = (grand_cited / grand_total * 100.0) if grand_total else 0.0
+
+    return {
+        "applicable": grand_total > 0,
+        "categories": categories,
+        "total": grand_total,
+        "cited": grand_cited,
+        "vague": grand_total - grand_cited,
+        "coverage_pct": coverage_pct,
+    }
+
+
+def render_evidence_coverage(ai_result: dict) -> None:
+    """Metric-card summary of the evidence coverage score, plus a per-category breakdown."""
+    coverage = compute_evidence_coverage(ai_result)
+    if not coverage.get("applicable"):
+        return
+
+    st.markdown("### 📐 Evidence Coverage")
+    pct = coverage["coverage_pct"]
+    accent = "#39d6a8" if pct >= 75 else ("#ffe06a" if pct >= 45 else "#ff6262")
+
+    cols = st.columns(4)
+    render_metric_card(cols[0], "Evidence Coverage", f"{pct:.0f}%", "📐", accent)
+    for col, cat in zip(cols[1:], coverage["categories"][:3]):
+        note = f"{cat['cited']}/{cat['total']} cited"
+        render_metric_card(col, cat["label"], note, "🔎", accent)
+
+    if coverage["vague"] > 0:
+        st.caption(
+            f"{coverage['vague']} of {coverage['total']} findings ({100 - pct:.0f}%) cite vague or missing "
+            "evidence rather than a specific, concrete reference. This is a text heuristic over the "
+            "model's existing JSON output — no extra AI calls are made."
+        )
+    else:
+        st.caption(
+            f"All {coverage['total']} findings cite specific, concrete evidence. "
+            "This is a text heuristic over the model's existing JSON output — no extra AI calls are made."
+        )
+
+
 def render_counter_hypotheses(ai_result: dict) -> None:
     """Render the AI's Devil's Advocate matrix so blind-spot checks are auditable."""
     rows = ai_result.get("counter_hypotheses") if ai_result else None
@@ -927,19 +1087,26 @@ def render_counter_hypotheses(ai_result: dict) -> None:
             st.divider()
 
 
-def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None:
+def render_whatif_calculator_body(driver_tree: dict, key_prefix: str = "cf", show_intro: bool = True) -> None:
     """
-    Render a fully local 'What-If' playground for confirmed high-severity problems.
+    Render the local 'What-If' revenue calculator UI.
 
     The sliders are bounded by historical observations from the profiling phase.
     Revenue is deterministically recomputed as:
         Traffic × Conversion Rate × AOV
 
-    No LLM/API call occurs when a slider moves.
+    No LLM/API call occurs when a slider moves. `key_prefix` keeps widget keys
+    unique when this is rendered in more than one place in the same run
+    (e.g. the gated in-analysis simulation and the standalone calculator tab).
     """
     if not driver_tree or not driver_tree.get("applicable"):
-        return
-    if not _high_severity_confirmed(ai_result):
+        st.info(
+            "The Traffic × Conversion Rate × AOV driver tree isn't available for the current "
+            "evidence. Upload dated Revenue, Traffic, and Orders (or Conversion Rate) data under "
+            "the **Generic Financial** framework to unlock the calculator."
+        )
+        if driver_tree and driver_tree.get("reason"):
+            st.caption(f"Reason: {driver_tree['reason']}")
         return
 
     baseline = driver_tree["baseline_metrics"]
@@ -962,11 +1129,18 @@ def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None
     c_lo, c_hi = bounds("conversion_rate", current["cvr"])
     a_lo, a_hi = bounds("aov", current["aov"])
 
-    st.markdown("### 🎛️ Counterfactual Simulation")
+    if show_intro:
+        st.markdown("### 🧮 Sales / Revenue Impact Calculator")
     st.caption(
-        "What-if analysis for confirmed high-severity problems. "
+        "What-if analysis you can run anytime — before, during, or after a confirmed problem. "
         "All calculations run locally from the mathematical driver tree; "
         "moving a slider does not call the AI."
+    )
+    mode_label = "explicit period comparison" if driver_tree.get("comparison_mode") == "manual" else "automatic chronological split"
+    st.caption(
+        f"Baseline {driver_tree['periods']['baseline']['start']} to {driver_tree['periods']['baseline']['end']} "
+        f"vs current {driver_tree['periods']['current']['start']} to {driver_tree['periods']['current']['end']} "
+        f"({mode_label})."
     )
 
     primary = driver_tree.get("primary_driver") or {}
@@ -984,7 +1158,7 @@ def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None
             min_value=float(t_lo),
             max_value=float(t_hi),
             value=float(current["traffic"]),
-            key="cf_traffic",
+            key=f"{key_prefix}_traffic",
             help="Historical minimum and maximum observed traffic."
         )
     with c2:
@@ -993,7 +1167,7 @@ def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None
             min_value=float(c_lo),
             max_value=float(c_hi),
             value=float(current["cvr"]),
-            key="cf_cvr",
+            key=f"{key_prefix}_cvr",
             format="%.2f%%",
             help="Historical minimum and maximum observed conversion rate."
         )
@@ -1003,7 +1177,7 @@ def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None
             min_value=float(a_lo),
             max_value=float(a_hi),
             value=float(current["aov"]),
-            key="cf_aov",
+            key=f"{key_prefix}_aov",
             format="%.2f",
             help="Historical minimum and maximum observed AOV."
         )
@@ -1039,12 +1213,37 @@ def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None
     )
 
 
-def build_evidence_payload(parsed_files: list, framework: str = "Generic Financial", user_question: str = "") -> dict:
+def render_counterfactual_simulation(driver_tree: dict, ai_result: dict) -> None:
+    """
+    Render the What-If calculator inline in the Analysis tab, but only once a
+    High/Critical problem has been confirmed by the AI — i.e. "we found a
+    real problem, now let's model fixing it". The unrestricted, always-on
+    version of the same calculator lives in the standalone "What-If
+    Calculator" tab (render_whatif_calculator_body), which needs no
+    confirmed finding to use.
+    """
+    if not driver_tree or not driver_tree.get("applicable"):
+        return
+    if not _high_severity_confirmed(ai_result):
+        return
+    st.markdown("### 🎛️ Counterfactual Simulation")
+    st.caption("A confirmed High/Critical problem was found — model correcting it below.")
+    render_whatif_calculator_body(driver_tree, key_prefix="cf_gated", show_intro=False)
+
+
+def build_evidence_payload(
+    parsed_files: list,
+    framework: str = "Generic Financial",
+    user_question: str = "",
+    driver_tree: dict = None,
+) -> dict:
+    if driver_tree is None:
+        driver_tree = compute_driver_tree_attribution(parsed_files, framework)
     payload = {
         "business_model_framework": framework,
         "user_question": (user_question or "").strip(),
         "framework_heuristics": compute_framework_heuristics(parsed_files, framework),
-        "driver_tree_attribution": compute_driver_tree_attribution(parsed_files, framework),
+        "driver_tree_attribution": driver_tree,
         "files": [],
     }
     for pf in parsed_files:
@@ -1134,6 +1333,56 @@ with st.sidebar:
         key="business_model_framework",
         help="Mandatory: selects the domain-specific heuristic engine and consulting persona.",
     )
+
+    st.markdown("#### 📊 Comparison Mode")
+    comparison_mode_enabled = st.checkbox(
+        "Compare two explicit periods",
+        value=st.session_state.get("comparison_mode_enabled", False),
+        key="comparison_mode_enabled",
+        help="Off: the driver tree auto-splits your dated evidence 50/50 (oldest half vs. newest half). "
+             "On: pick exact 'this period vs. that period' date ranges yourself — "
+             "e.g. this month vs. last month.",
+    )
+    if comparison_mode_enabled:
+        bounds_lo, bounds_hi = _global_date_bounds(st.session_state.get("parsed_files", []))
+        default_lo = bounds_lo or datetime(2024, 1, 1).date()
+        default_hi = bounds_hi or datetime(2024, 1, 31).date()
+        default_mid = default_lo + (default_hi - default_lo) / 2
+
+        st.caption("Baseline period (e.g. last month)")
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            st.date_input(
+                "Baseline start", key="comparison_baseline_start",
+                value=st.session_state.get("comparison_baseline_start", default_lo),
+                min_value=bounds_lo, max_value=bounds_hi,
+                label_visibility="collapsed",
+            )
+        with bcol2:
+            st.date_input(
+                "Baseline end", key="comparison_baseline_end",
+                value=st.session_state.get("comparison_baseline_end", default_mid),
+                min_value=bounds_lo, max_value=bounds_hi,
+                label_visibility="collapsed",
+            )
+        st.caption("Comparison period (e.g. this month)")
+        ccol1, ccol2 = st.columns(2)
+        with ccol1:
+            st.date_input(
+                "Current start", key="comparison_current_start",
+                value=st.session_state.get("comparison_current_start", default_mid),
+                min_value=bounds_lo, max_value=bounds_hi,
+                label_visibility="collapsed",
+            )
+        with ccol2:
+            st.date_input(
+                "Current end", key="comparison_current_end",
+                value=st.session_state.get("comparison_current_end", default_hi),
+                min_value=bounds_lo, max_value=bounds_hi,
+                label_visibility="collapsed",
+            )
+        if bounds_lo is None:
+            st.caption("Load or upload dated evidence to see available date bounds here.")
 
     st.markdown("#### ❓ Ask a Question About Your Data")
     st.caption("Optional: ask anything about the uploaded evidence before running the analysis.")
@@ -1233,12 +1482,18 @@ if run_clicked:
         try:
             with st.spinner("Parsing evidence and consulting Root Cause AI..."):
                 client = get_client()
+                baseline_range, current_range = _resolve_comparison_ranges()
+                driver_tree = compute_driver_tree_attribution(
+                    parsed, st.session_state.business_model_framework,
+                    baseline_range, current_range,
+                )
                 payload = build_evidence_payload(
                     parsed,
                     st.session_state.business_model_framework,
                     st.session_state.user_question,
+                    driver_tree=driver_tree,
                 )
-                st.session_state.driver_tree = payload.get("driver_tree_attribution")
+                st.session_state.driver_tree = driver_tree
                 ai_result = analyze_root_cause(client, payload)
             st.session_state.ai_result = ai_result
             st.session_state.timeline_df = build_full_timeline(parsed, ai_result)
@@ -1288,7 +1543,19 @@ if st.session_state.user_question.strip():
         unsafe_allow_html=True,
     )
 timeline_df = st.session_state.timeline_df
-driver_tree = st.session_state.get("driver_tree")
+
+# The driver tree (and therefore the What-If Calculator) is recomputed live
+# from whatever evidence + comparison settings are currently loaded, so it's
+# available to explore any time — not only after a confirmed AI finding.
+if parsed_files:
+    _baseline_range, _current_range = _resolve_comparison_ranges()
+    driver_tree = compute_driver_tree_attribution(
+        parsed_files, selected_framework, _baseline_range, _current_range,
+    )
+    st.session_state.driver_tree = driver_tree
+else:
+    driver_tree = None
+
 ai_config = get_ai_config()
 
 if (not ai_config.configured) or st.session_state.get("ai_config_error", False):
@@ -1340,8 +1607,8 @@ st.write("")
 # Tabs
 # =============================================================================
 
-tab_preview, tab_analysis, tab_timeline, tab_export = st.tabs(
-    ["📄 Data Preview", "🔍 Root Cause Analysis", "📈 Interactive Timeline", "📤 Export Reports"]
+tab_preview, tab_analysis, tab_calculator, tab_timeline, tab_export = st.tabs(
+    ["📄 Data Preview", "🔍 Root Cause Analysis", "🧮 What-If Calculator", "📈 Interactive Timeline", "📤 Export Reports"]
 )
 
 
@@ -1390,12 +1657,16 @@ with tab_analysis:
         st.markdown("### Summary")
         st.write(ai_result.get("summary", ""))
 
+        render_evidence_coverage(ai_result)
+
         if driver_tree and driver_tree.get("applicable"):
             st.markdown("### 🌳 Mathematical Driver Tree")
+            mode_note = "explicit period comparison" if driver_tree.get("comparison_mode") == "manual" else "automatic chronological split"
             st.caption(
                 f"{driver_tree['relationship']} · "
                 f"Baseline {driver_tree['periods']['baseline']['start']} to {driver_tree['periods']['baseline']['end']} "
-                f"vs current {driver_tree['periods']['current']['start']} to {driver_tree['periods']['current']['end']}"
+                f"vs current {driver_tree['periods']['current']['start']} to {driver_tree['periods']['current']['end']} "
+                f"({mode_note})"
             )
             dt_cols = st.columns(3)
             for col, item in zip(dt_cols, driver_tree["attributions"]):
@@ -1471,7 +1742,25 @@ with tab_analysis:
             st.caption("No recommended actions were generated.")
 
 
-# --- Tab 3: Interactive Timeline --------------------------------------------
+# --- Tab 3: What-If Calculator ----------------------------------------------
+with tab_calculator:
+    st.markdown("### 🧮 Sales / Revenue Impact Calculator")
+    st.caption(
+        "Explore Traffic × Conversion Rate × AOV scenarios any time — you don't need to run a full "
+        "root-cause analysis or have a confirmed High/Critical finding first."
+    )
+    if not parsed_files:
+        st.info("Upload evidence in the sidebar (or load the sample bundle) to use the calculator.")
+    elif selected_framework != "Generic Financial":
+        st.warning(
+            "The Traffic × Conversion Rate × AOV driver tree is only computed for the "
+            "**Generic Financial** framework. Switch frameworks in the sidebar to use this calculator."
+        )
+    else:
+        render_whatif_calculator_body(driver_tree, key_prefix="whatif_tab", show_intro=False)
+
+
+# --- Tab 4: Interactive Timeline --------------------------------------------
 with tab_timeline:
     if not parsed_files:
         st.info("Upload evidence to build a timeline.")
@@ -1487,35 +1776,76 @@ with tab_timeline:
                 st.dataframe(timeline_df, use_container_width=True)
 
 
-# --- Tab 4: Export Reports ---------------------------------------------------
+# --- Tab 5: Export Reports ---------------------------------------------------
 with tab_export:
     if not parsed_files:
         st.info("Run an analysis first, then export the report here.")
     else:
         filenames = [pf["filename"] for pf in parsed_files]
         generated_at = st.session_state.last_run_at or datetime.now()
-        md_report = report.generate_markdown_report(ai_result, filenames, generated_at)
 
+        st.markdown("#### Branding")
+        brand_col1, brand_col2 = st.columns([2, 1])
+        with brand_col1:
+            company_name = st.text_input(
+                "Company name (optional)",
+                key="report_company_name",
+                placeholder="e.g. Acme Retail Inc.",
+                help="Shown on the report cover page / summary header.",
+            )
+        with brand_col2:
+            logo_file = st.file_uploader(
+                "Logo (optional)", type=["png", "jpg", "jpeg"], key="report_logo_upload",
+                help="Shown on the report cover page / summary header.",
+            )
+        logo_bytes = logo_file.read() if logo_file is not None else None
+
+        st.markdown("#### Report Type")
+        report_mode_label = st.radio(
+            "Report Type",
+            options=["Full Report", "Executive Summary (One-Pager)"],
+            key="report_mode_choice",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        report_mode = "executive" if report_mode_label.startswith("Executive") else "full"
+        if report_mode == "executive":
+            st.caption(
+                "Best-effort single page: summary, impact assessment, top anomaly, primary trigger "
+                "event, and the top 3 recommended actions — no cover page, no full tables."
+            )
+        else:
+            st.caption("Full report with a dedicated cover page and every section/table.")
+
+        md_report = report.generate_markdown_report(
+            ai_result, filenames, generated_at, company_name=company_name or None, mode=report_mode,
+        )
+
+        st.divider()
         st.markdown("### Report Preview")
         st.markdown(md_report)
 
         st.divider()
+        file_suffix = "executive_summary" if report_mode == "executive" else "report"
         col_a, col_b = st.columns(2)
         with col_a:
             st.download_button(
                 "⬇️ Download Markdown",
                 data=md_report,
-                file_name="root_cause_ai_report.md",
+                file_name=f"root_cause_ai_{file_suffix}.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
         with col_b:
             try:
-                pdf_bytes = report.generate_pdf_report(ai_result, filenames, generated_at)
+                pdf_bytes = report.generate_pdf_report(
+                    ai_result, filenames, generated_at,
+                    logo_bytes=logo_bytes, company_name=company_name or None, mode=report_mode,
+                )
                 st.download_button(
                     "⬇️ Download PDF",
                     data=pdf_bytes,
-                    file_name="root_cause_ai_report.pdf",
+                    file_name=f"root_cause_ai_{file_suffix}.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                 )
