@@ -119,6 +119,14 @@ customer complaint text, or email content. Reason ONLY over the evidence provide
 facts, numbers, dates, or names that are not present in the input. If the evidence is insufficient
 to determine a cause, say so explicitly rather than guessing.
 
+USER QUESTION / DATA Q&A:
+The evidence payload may contain a `user_question`. If it is non-empty, treat it as a first-class
+analytical requirement. Directly answer the user's question using ONLY the supplied evidence. Put the
+direct answer in `question_answer`, then use the normal root-cause structure to explain the evidence
+behind it. If the question cannot be answered from the evidence, say exactly what is missing instead
+of guessing. If `user_question` is empty, set `question_answer` to a concise statement that the
+analysis was performed as a general root-cause review.
+
 Distinguish correlation from causation. Use language like "likely", "consistent with", or
 "associated with" rather than "proven" or "confirmed" unless the evidence is direct and
 unambiguous (rare).
@@ -159,6 +167,7 @@ allocation. If the driver tree is not applicable, do not invent one.
 Respond with JSON only — no markdown code fences, no prose before or after — matching exactly this
 schema:
 {
+  "question_answer": "string, direct answer to the user's question; if no question was supplied, briefly state that this is a general root-cause review",
   "summary": "string, 2-4 sentence plain-language overview",
   "anomalies": [
     {"description": "string", "evidence": "string", "severity": "Low|Medium|High|Critical"}
@@ -253,7 +262,7 @@ def analyze_root_cause(client: AIClient, evidence_payload: dict, model: str = No
     except json.JSONDecodeError:
         return {"_parse_failed": True, "_raw_text": raw}
 
-    required_keys = ["summary", "anomalies", "trigger_events", "impact_assessment",
+    required_keys = ["question_answer", "summary", "anomalies", "trigger_events", "impact_assessment",
                      "recommended_actions", "counter_hypotheses"]
     if not all(k in parsed for k in required_keys):
         return {"_parse_failed": True, "_raw_text": raw}
