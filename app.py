@@ -1400,18 +1400,7 @@ with st.sidebar:
         key="business_model_framework",
         help="Mandatory: selects the domain-specific heuristic engine and consulting persona.",
     )
-
-    with st.expander("📚 Benchmark Library (reference)"):
-        st.caption(
-            "Industry-typical thresholds for the selected framework. General reference points, "
-            "not a guarantee for any specific business — the AI uses these only to calibrate "
-            "severity language, never as a substitute for your actual evidence."
-        )
-        rows = benchmarks.get_benchmarks_for_framework(business_model_framework)
-        if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        else:
-            st.caption("No benchmark reference points defined for this framework yet.")
+    st.caption("📚 See the **Benchmark Library** tab on the main screen for this framework's reference thresholds.")
 
     st.markdown("#### 📊 Comparison Mode")
     comparison_mode_enabled = st.checkbox(
@@ -1793,8 +1782,9 @@ st.write("")
 # Tabs
 # =============================================================================
 
-tab_preview, tab_analysis, tab_calculator, tab_timeline, tab_export = st.tabs(
-    ["📄 Data Preview", "🔍 Root Cause Analysis", "🧮 What-If Calculator", "📈 Interactive Timeline", "📤 Export Reports"]
+tab_preview, tab_analysis, tab_calculator, tab_benchmarks, tab_timeline, tab_export = st.tabs(
+    ["📄 Data Preview", "🔍 Root Cause Analysis", "🧮 What-If Calculator", "📊 Benchmark Library",
+     "📈 Interactive Timeline", "📤 Export Reports"]
 )
 
 
@@ -1960,7 +1950,42 @@ with tab_calculator:
         render_whatif_calculator_body(driver_tree, key_prefix="whatif_tab", show_intro=False)
 
 
-# --- Tab 4: Interactive Timeline --------------------------------------------
+# --- Tab 4: Benchmark Library ------------------------------------------------
+with tab_benchmarks:
+    st.markdown("### 📊 Benchmark Library")
+    st.caption(
+        f"Industry-typical reference thresholds for the **{selected_framework}** framework. "
+        "These are general rules of thumb, not a guarantee for any specific business — the AI "
+        "uses them only to calibrate severity language, never as a substitute for your actual evidence."
+    )
+
+    benchmark_rows = benchmarks.get_benchmarks_for_framework(selected_framework)
+    if benchmark_rows:
+        st.dataframe(pd.DataFrame(benchmark_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No benchmark reference points are defined for this framework yet.")
+
+    st.markdown("#### ⚠️ Your Evidence vs. Benchmark")
+    if not parsed_files:
+        st.info("Upload evidence in the sidebar (or load the sample bundle) to compare your own numbers against these thresholds.")
+    else:
+        heuristics_for_flags = compute_framework_heuristics(parsed_files, selected_framework)
+        flags = benchmarks.evaluate_against_benchmarks(selected_framework, heuristics_for_flags, driver_tree)
+        if flags:
+            flag_df = pd.DataFrame(flags)
+            flag_df["flagged"] = flag_df["flagged"].map(lambda v: "⚠️ Exceeds benchmark" if v else "✅ Within range")
+            flag_df = flag_df.rename(columns={
+                "metric": "Metric", "observed": "Observed", "threshold": "Benchmark", "flagged": "Status",
+            })
+            st.dataframe(flag_df, hide_index=True, use_container_width=True)
+        else:
+            st.caption(
+                "No concrete numbers could be compared yet — run the analysis (or check that your "
+                "evidence includes the fields this framework's heuristics need)."
+            )
+
+
+# --- Tab 5: Interactive Timeline --------------------------------------------
 with tab_timeline:
     if not parsed_files:
         st.info("Upload evidence to build a timeline.")
@@ -1976,7 +2001,7 @@ with tab_timeline:
                 st.dataframe(timeline_df, use_container_width=True)
 
 
-# --- Tab 5: Export Reports ---------------------------------------------------
+# --- Tab 6: Export Reports ---------------------------------------------------
 with tab_export:
     if not parsed_files:
         st.info("Run an analysis first, then export the report here.")
