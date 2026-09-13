@@ -22,6 +22,16 @@ from groq import Groq
 DEFAULT_PROVIDER = "groq"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
+# Curated set of Groq-hosted models an admin may switch to. The first entry
+# is always the production default used for every analyst-run analysis
+# unless an admin has explicitly overridden it for the session.
+SELECTABLE_GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+
 
 class GroqClientError(Exception):
     """Backward-compatible application-level AI configuration/API error."""
@@ -57,25 +67,28 @@ def _setting(name: str, default=None):
     return default
 
 
-def get_ai_config() -> AIConfig:
-    """Return the fixed Groq GPT-OSS-120B configuration."""
+def get_ai_config(model_override: str = None) -> AIConfig:
+    """Return the Groq configuration. `model_override` is only ever honored
+    when explicitly passed by the caller (app.py only does this for an
+    authenticated admin session) — every analyst-run analysis uses the
+    fixed production default."""
     provider = "groq"
     key = _setting("GROQ_API_KEY")
-    model = "openai/gpt-oss-120b"
+    model = model_override if model_override in SELECTABLE_GROQ_MODELS else DEFAULT_GROQ_MODEL
     return AIConfig(provider=provider, model=model, api_key=key, configured=bool(key and model))
 
 
-def get_client(api_key: str = None):
+def get_client(api_key: str = None, model_override: str = None):
     """Create the configured provider client. The optional key is retained only
     for backward compatibility; the production UI never supplies one."""
-    config = get_ai_config()
+    config = get_ai_config(model_override=model_override)
     key = api_key or config.api_key
 
     if not key:
         raise GroqClientError("AI engine is not configured.")
 
     try:
-        return AIClient(provider="groq", model="openai/gpt-oss-120b", client=Groq(api_key=key))
+        return AIClient(provider="groq", model=config.model, client=Groq(api_key=key))
     except GroqClientError:
         raise
     except Exception as e:
@@ -163,6 +176,13 @@ override, recalculate, or invent different attribution percentages. Use the supp
 contributions and percentages when explaining the revenue movement. The `first_order_approximation`
 and `interaction_residual` are diagnostic details; the exact additive attribution is the Shapley
 allocation. If the driver tree is not applicable, do not invent one.
+
+INDUSTRY BENCHMARK RULE:
+The payload may contain `industry_benchmarks`, a list of {metric, threshold, note} reference
+points for this business model framework. These are general rules of thumb, not universal
+truths — use them only to calibrate severity language (e.g. noting that an observed change
+exceeds or falls within a commonly cited threshold), never as a substitute for the actual
+evidence, and never claim a benchmark applies with certainty to this specific business.
 
 Respond with JSON only — no markdown code fences, no prose before or after — matching exactly this
 schema:
