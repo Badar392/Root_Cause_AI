@@ -1,0 +1,26 @@
+# Virtual environments (this is what was pulling C/C++/Cython/Fortran into
+# the GitHub language stats -- numpy/pandas/scipy ship that source inside
+# the packages installed here)
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode/caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Streamlit secrets -- never commit real credentials
+.streamlit/secrets.toml
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Local databases used for testing the database connector
+*.db
+*.sqlite
+*.sqlite3
