@@ -1105,7 +1105,7 @@ for key, default in [
     ("user_question", ""),
     ("parsed_files", []), ("ai_result", None), ("timeline_df", None),
     ("driver_tree", None), ("last_run_at", None), ("parse_errors", []),
-    ("ai_config_error", False),
+    ("ai_config_error", False), ("last_run_error", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1230,10 +1230,24 @@ if run_clicked:
             st.session_state.ai_result = ai_result
             st.session_state.timeline_df = build_full_timeline(parsed, ai_result)
             st.session_state.last_run_at = datetime.now()
-        except GroqClientError:
-            # Never expose infrastructure/API details in the UI.
+            st.session_state.ai_config_error = False
+            st.session_state.last_run_error = None
+            st.sidebar.success("Analysis complete — see the results in the tabs below.")
+        except GroqClientError as e:
+            # The end-user banner stays generic on purpose, but we keep the real
+            # message so it's visible right where the click happened, and so it
+            # can be diagnosed instead of silently vanishing.
             st.session_state.ai_result = None
             st.session_state.ai_config_error = True
+            st.session_state.last_run_error = str(e)
+            st.sidebar.error(f"Analysis failed: {e}")
+        except Exception as e:
+            # Anything unexpected (bad data, a code bug, etc.) used to crash
+            # silently or produce no visible feedback at all. Surface it instead.
+            st.session_state.ai_result = None
+            st.session_state.ai_config_error = False
+            st.session_state.last_run_error = f"{type(e).__name__}: {e}"
+            st.sidebar.error(f"Analysis failed unexpectedly: {type(e).__name__}: {e}")
 
 
 # =============================================================================
@@ -1273,6 +1287,14 @@ if (not ai_config.configured) or st.session_state.get("ai_config_error", False):
         </div>
     </div>
     """, unsafe_allow_html=True)
+    with st.expander("Technical details (for the app owner/admin)"):
+        if not ai_config.configured:
+            st.write(
+                "`GROQ_API_KEY` is not set. Add it to `.streamlit/secrets.toml` as "
+                "`GROQ_API_KEY = \"...\"`, or set it as an environment variable, then restart the app."
+            )
+        if st.session_state.get("last_run_error"):
+            st.code(st.session_state["last_run_error"])
 
 # =============================================================================
 # Metrics row
