@@ -24,7 +24,13 @@ from groq_client import GroqClientError, get_client, analyze_root_cause, get_ai_
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLE_DIR = os.path.join(APP_DIR, "sample_data")
+# FIX #1: sales.csv, ad_spend.csv, ga_export.csv, complaints.txt, and
+# error_logs.txt live at the repo root next to app.py (confirmed from the
+# GitHub file listing) — there is no "sample_data" subfolder. Pointing
+# SAMPLE_DIR at APP_DIR itself resolves the "Sample file missing" errors.
+# If you later move the sample files into an actual sample_data/ folder,
+# revert this to: os.path.join(APP_DIR, "sample_data")
+SAMPLE_DIR = APP_DIR
 SAMPLE_FILES = ["sales.csv", "ad_spend.csv", "ga_export.csv", "complaints.txt", "error_logs.txt"]
 
 ACCEPTED_TYPES = ["csv", "pdf", "docx", "txt", "eml"]
@@ -1170,13 +1176,20 @@ with st.sidebar:
 
 if reset_clicked:
     st.session_state.parsed_files = []
-    st.session_state.user_question = ""
+    # FIX #2: assigning to st.session_state.user_question here raises
+    # StreamlitAPIException, because the st.text_area(key="user_question")
+    # widget above has already been instantiated earlier in this same script
+    # run. Deleting the key is allowed post-instantiation; on st.rerun() the
+    # widget reinitializes to its default value ("").
+    if "user_question" in st.session_state:
+        del st.session_state["user_question"]
     st.session_state.ai_result = None
     st.session_state.ai_config_error = False
     st.session_state.timeline_df = None
     st.session_state.driver_tree = None
     st.session_state.last_run_at = None
     st.session_state.parse_errors = []
+    st.session_state.last_run_error = None  # also clear any stale error banner
     st.rerun()
 
 if load_sample:
