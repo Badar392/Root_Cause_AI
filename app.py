@@ -25,10 +25,7 @@ import connectors
 import benchmarks
 import incident_store
 import quality
-from groq_client import (
-    GroqClientError, get_client, analyze_root_cause, get_ai_config,
-    SELECTABLE_GROQ_MODELS, DEFAULT_GROQ_MODEL,
-)
+from groq_client import GroqClientError, get_client, analyze_root_cause, get_ai_config
 
 incident_store.init_db()
 
@@ -51,32 +48,6 @@ BUSINESS_MODEL_FRAMEWORKS = [
     "SaaS / Subscription (MRR/Churn)",
     "B2B Marketing Funnel",
 ]
-
-
-# =============================================================================
-# Role-based access
-# =============================================================================
-# Single-app, single-tenant "role" distinction, not a full multi-user auth
-# system: everyone starts as "analyst" (can run analyses, use connectors with
-# admin-configured credentials, view benchmarks). Entering the correct admin
-# passcode for this session unlocks "admin" (sees AI configuration status,
-# can override the model, sees alerting/connector configuration status).
-# The passcode itself is infra, resolved the same hidden way as every other
-# secret in this app — never hardcoded, never displayed.
-
-def _admin_passcode_configured() -> str | None:
-    try:
-        value = st.secrets.get("ADMIN_PASSCODE", None)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    except Exception:
-        pass
-    env_value = os.environ.get("ADMIN_PASSCODE")
-    return env_value.strip() if env_value and env_value.strip() else None
-
-
-def is_admin() -> bool:
-    return st.session_state.get("user_role") == "admin"
 
 
 # =============================================================================
@@ -1354,7 +1325,6 @@ for key, default in [
     ("parsed_files", []), ("ai_result", None), ("timeline_df", None),
     ("driver_tree", None), ("last_run_at", None), ("parse_errors", []),
     ("ai_config_error", False), ("last_run_error", None),
-    ("user_role", "analyst"), ("admin_model_override", None),
     ("alert_results", []), ("connector_error", None),
     ("current_incident_id", None), ("severity_info", None), ("confidence_info", None),
     ("evidence_source_coverage", None), ("data_quality", None),
@@ -1372,30 +1342,6 @@ with st.sidebar:
     st.caption("Evidence in. Root cause out.")
     st.divider()
 
-    # -------------------------------------------------------------------
-    # Role-based access
-    # -------------------------------------------------------------------
-    if is_admin():
-        st.markdown("#### 🔐 Access Level")
-        st.success("Admin mode unlocked", icon="🔓")
-        if st.button("Log out of admin mode", use_container_width=True, key="admin_logout_btn"):
-            st.session_state.user_role = "analyst"
-            st.rerun()
-    else:
-        with st.expander("🔐 Admin sign-in"):
-            st.caption("Analysts can run analyses, use connectors, and view benchmarks without this. "
-                       "Admin mode additionally shows AI/alerting/connector configuration status and "
-                       "lets you override the model.")
-            if not _admin_passcode_configured():
-                st.caption("Admin mode is not configured for this deployment (`ADMIN_PASSCODE` not set).")
-            else:
-                admin_pw = st.text_input("Admin passcode", type="password", key="admin_passcode_input")
-                if st.button("Unlock", key="admin_unlock_btn"):
-                    if admin_pw and admin_pw == _admin_passcode_configured():
-                        st.session_state.user_role = "admin"
-                        st.rerun()
-                    else:
-                        st.error("Incorrect passcode.")
     st.divider()
 
     st.markdown("#### 🧭 Business Model Framework")
@@ -1503,9 +1449,9 @@ with st.sidebar:
 
     elif connector_choice == "Database Query":
         if connector_config.database_configured:
-            st.caption("✅ Database connection configured by your admin.")
+            st.caption("✅ Database connection configured.")
         else:
-            st.caption("⚠️ No database connection configured. Ask your admin to set `DATABASE_URL`.")
+            st.caption("⚠️ No database connection configured. Set `DATABASE_URL` in your environment or Streamlit secrets.")
         db_query = st.text_area("SQL query (SELECT/WITH only)", key="connector_db_query", height=90,
                                  placeholder="SELECT date, revenue, orders FROM sales ORDER BY date")
         connector_fetch_clicked = st.button("📥 Run Query", use_container_width=True, key="fetch_db_btn",
@@ -1514,9 +1460,9 @@ with st.sidebar:
 
     elif connector_choice == "Stripe":
         if connector_config.stripe_configured:
-            st.caption("✅ Stripe connection configured by your admin.")
+            st.caption("✅ Stripe connection configured.")
         else:
-            st.caption("⚠️ No Stripe key configured. Ask your admin to set `STRIPE_API_KEY`.")
+            st.caption("⚠️ No Stripe key configured. Set `STRIPE_API_KEY` in your environment or Streamlit secrets.")
         stripe_lookback = st.slider("Lookback (days)", 7, 365, 90, key="connector_stripe_lookback")
         connector_fetch_clicked = st.button("📥 Fetch Stripe Revenue", use_container_width=True, key="fetch_stripe_btn",
                                              disabled=not connector_config.stripe_configured)
@@ -1524,9 +1470,9 @@ with st.sidebar:
 
     elif connector_choice == "Google Analytics 4":
         if connector_config.ga4_configured:
-            st.caption("✅ GA4 connection configured by your admin.")
+            st.caption("✅ GA4 connection configured.")
         else:
-            st.caption("⚠️ No GA4 connection configured. Ask your admin to set `GA4_PROPERTY_ID` / `GA4_CREDENTIALS_PATH`.")
+            st.caption("⚠️ No GA4 connection configured. Set `GA4_PROPERTY_ID` / `GA4_CREDENTIALS_PATH` in your environment or Streamlit secrets.")
         ga4_lookback = st.slider("Lookback (days)", 7, 365, 90, key="connector_ga4_lookback")
         connector_fetch_clicked = st.button("📥 Fetch GA4 Traffic", use_container_width=True, key="fetch_ga4_btn",
                                              disabled=not connector_config.ga4_configured)
@@ -1542,27 +1488,7 @@ with st.sidebar:
     run_clicked = st.button("🚀 Run Root Cause Analysis", type="primary", use_container_width=True)
     reset_clicked = st.button("🗑️ Clear Session", use_container_width=True)
 
-    if is_admin():
-        st.divider()
-        st.markdown("#### ⚙️ Admin Controls")
-        with st.expander("🧠 AI Model Override"):
-            model_choice = st.selectbox(
-                "Model (this session only)",
-                options=["(use default)"] + SELECTABLE_GROQ_MODELS,
-                key="admin_model_choice",
-            )
-            st.session_state.admin_model_override = None if model_choice == "(use default)" else model_choice
-            st.caption(f"Default: `{DEFAULT_GROQ_MODEL}`")
-        with st.expander("🔔 Alerting Status"):
-            alert_cfg = alerts.get_alert_config()
-            st.write(f"Slack: {'✅ Configured' if alert_cfg.slack_configured else '⚠️ Not configured'}")
-            st.write(f"Email: {'✅ Configured' if alert_cfg.email_configured else '⚠️ Not configured'}")
-            st.caption("Alerts auto-send when a run confirms a High/Critical finding. "
-                       "Configured via `SLACK_WEBHOOK_URL` / `ALERT_SMTP_*` secrets.")
-        with st.expander("🔌 Connector Status"):
-            st.write(f"Database: {'✅ Configured' if connector_config.database_configured else '⚠️ Not configured'}")
-            st.write(f"Stripe: {'✅ Configured' if connector_config.stripe_configured else '⚠️ Not configured'}")
-            st.write(f"GA4: {'✅ Configured' if connector_config.ga4_configured else '⚠️ Not configured'}")
+
 
 
 # =============================================================================
@@ -1650,8 +1576,7 @@ if run_clicked:
     if parsed:
         try:
             with st.spinner("Parsing evidence and consulting Root Cause AI..."):
-                model_override = st.session_state.get("admin_model_override") if is_admin() else None
-                client = get_client(model_override=model_override)
+                client = get_client()
                 baseline_range, current_range = _resolve_comparison_ranges()
                 driver_tree = compute_driver_tree_attribution(
                     parsed, st.session_state.business_model_framework,
@@ -1786,21 +1711,18 @@ if (not ai_config.configured) or st.session_state.get("ai_config_error", False):
     <div class="rc-config-alert">
         <div class="rc-config-alert-icon">⚙️</div>
         <div>
-            <div class="rc-config-alert-title">System configuration in progress. Please contact your administrator to connect the analysis engine.</div>
+            <div class="rc-config-alert-title">System configuration in progress. Configure the analysis engine with `GROQ_API_KEY` in your environment or Streamlit secrets.</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
-    if is_admin():
-        with st.expander("Technical details (admin)"):
-            if not ai_config.configured:
-                st.write(
-                    "`GROQ_API_KEY` is not set. Add it to `.streamlit/secrets.toml` as "
-                    "`GROQ_API_KEY = \"...\"`, or set it as an environment variable, then restart the app."
-                )
-            if st.session_state.get("last_run_error"):
-                st.code(st.session_state["last_run_error"])
-    else:
-        st.caption("Sign in as an admin in the sidebar to see configuration details.")
+    if not ai_config.configured:
+        st.caption(
+            "Add `GROQ_API_KEY` to Streamlit secrets or your environment variables, "
+            "then restart the app."
+        )
+    if st.session_state.get("last_run_error"):
+        with st.expander("Technical details"):
+            st.code(st.session_state["last_run_error"])
 
 # =============================================================================
 # Metrics row
