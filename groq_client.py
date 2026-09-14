@@ -22,17 +22,6 @@ from groq import Groq
 DEFAULT_PROVIDER = "groq"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
-# Curated set of Groq-hosted models an admin may switch to. The first entry
-# is always the production default used for every analyst-run analysis
-# unless an admin has explicitly overridden it for the session.
-SELECTABLE_GROQ_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-]
-
-
 class GroqClientError(Exception):
     """Backward-compatible application-level AI configuration/API error."""
 
@@ -67,21 +56,17 @@ def _setting(name: str, default=None):
     return default
 
 
-def get_ai_config(model_override: str = None) -> AIConfig:
-    """Return the Groq configuration. `model_override` is only ever honored
-    when explicitly passed by the caller (app.py only does this for an
-    authenticated admin session) — every analyst-run analysis uses the
-    fixed production default."""
+def get_ai_config() -> AIConfig:
+    """Return the configured Groq provider and production model."""
     provider = "groq"
     key = _setting("GROQ_API_KEY")
-    model = model_override if model_override in SELECTABLE_GROQ_MODELS else DEFAULT_GROQ_MODEL
+    model = DEFAULT_GROQ_MODEL
     return AIConfig(provider=provider, model=model, api_key=key, configured=bool(key and model))
 
 
-def get_client(api_key: str = None, model_override: str = None):
-    """Create the configured provider client. The optional key is retained only
-    for backward compatibility; the production UI never supplies one."""
-    config = get_ai_config(model_override=model_override)
+def get_client(api_key: str = None):
+    """Create the configured provider client."""
+    config = get_ai_config()
     key = api_key or config.api_key
 
     if not key:
