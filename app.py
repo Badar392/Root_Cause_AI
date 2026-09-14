@@ -144,7 +144,27 @@ section[data-testid="stSidebar"] > div {
 }
 
 section[data-testid="stSidebar"] .block-container {
-    padding: 1rem 0.85rem 1.35rem 0.85rem !important;
+    padding: 0.65rem 0.85rem 0.85rem 0.85rem !important;
+}
+
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] h4 {
+    margin-top: 0.55rem !important;
+    margin-bottom: 0.3rem !important;
+}
+
+section[data-testid="stSidebar"] .stCaption,
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+    margin-top: 0.15rem !important;
+    margin-bottom: 0.35rem !important;
+}
+
+section[data-testid="stSidebar"] hr {
+    margin: 0.45rem 0 !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.45rem !important;
 }
 
 section[data-testid="stSidebar"] .stMarkdown p,
@@ -1342,8 +1362,6 @@ with st.sidebar:
     st.caption("Evidence in. Root cause out.")
     st.divider()
 
-    st.divider()
-
     st.markdown("#### 🧭 Business Model Framework")
     business_model_framework = st.selectbox(
         "Business Model Framework",
@@ -1487,9 +1505,6 @@ with st.sidebar:
     st.divider()
     run_clicked = st.button("🚀 Run Root Cause Analysis", type="primary", use_container_width=True)
     reset_clicked = st.button("🗑️ Clear Session", use_container_width=True)
-
-
-
 
 # =============================================================================
 # Sidebar button handling
