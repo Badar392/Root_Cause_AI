@@ -76,9 +76,6 @@ Open the app, load evidence, and you get:
   shape as a CSV upload, so they flow through the whole pipeline unchanged.
 - **Alerting/webhooks** — Slack and/or email, auto-fired on a confirmed
   High/Critical finding, best-effort and never blocking the run.
-- **Role-based access** — analysts get the full investigation workflow with
-  infrastructure hidden; an admin passcode unlocks AI configuration status
-  and a per-session model override.
 - **Incident persistence (SQLite)** — every completed run is saved as an
   incident with a status workflow (Detected → Investigating → Root Cause
   Identified → Remediation In Progress → Resolved → Monitoring), a
@@ -230,15 +227,12 @@ cp .env.example .env
 |---|---|
 | `GROQ_API_KEY` (required) | AI engine |
 | `GROQ_MODEL` | Defaults to `openai/gpt-oss-120b` |
-| `ADMIN_PASSCODE` | Unlocks admin mode (AI config visibility, model override) |
 | `SLACK_WEBHOOK_URL`, `ALERT_SMTP_*` | Alerting on confirmed High/Critical findings |
 | `DATABASE_URL`, `STRIPE_API_KEY`, `GA4_PROPERTY_ID`, `GA4_CREDENTIALS_PATH` | Data connectors |
 
 Locally, `.streamlit/secrets.toml` also works. On Streamlit Community Cloud,
 set these under the app's **Secrets** panel and reboot after changes. The
-app never renders secret values in the UI — a missing/invalid key shows
-only a generic administrator-facing message (with the real error visible to
-admins under **Technical details**).
+app never renders secret values in the UI — a missing/invalid key shows a clear configuration message and optional technical details.
 
 > **Note on persistence:** `incident_store.py` writes `incidents.db` next to
 > `app.py`. On Streamlit Community Cloud's default (ephemeral) filesystem,
@@ -279,7 +273,7 @@ admins under **Technical details**).
 
 - **"System configuration in progress"** — `GROQ_API_KEY` isn't set (or is
   invalid). Check `.streamlit/secrets.toml` / environment variables, or the
-  admin **Technical details** expander for the exact error.
+  **Technical details** expander for the exact error.
 - **PDF/DOCX parsing errors** — scanned/image-only PDFs have no extractable
   text; OCR is out of scope. Try a text-based PDF instead.
 - **AI response couldn't be parsed** — occasionally a model returns
